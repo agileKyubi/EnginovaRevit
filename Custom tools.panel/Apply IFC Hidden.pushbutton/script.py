@@ -1,111 +1,106 @@
-# -*- coding: utf-8 -*-
+# Apply IFC Hidden property into new IFC revision
+
+from pyrevit import revit, forms
+from pyrevit import script
 import json
-from pyrevit import revit, forms, DB
+import math
+from Autodesk.Revit.DB import *
 
-# --- CONFIGURATION ---
-IFC_GUID_PARAM = "IfcGuid"
+doc = revit.doc
+active_view = doc.ActiveView
 
-def run():
-    doc = revit.doc
-    view = doc.ActiveView
+# Convert 50mm tolerance to Decimal Feet for the Revit API
+TOLERANCE_FEET = 50 / 304.8
 
-    # 1. Load JSON
-    json_path = forms.pick_file(file_ext='json', title="Select IFC Visibility JSON")
-    if not json_path:
-        return
+def get_centroid(bbox):
+    if not bbox:
+        return None
+    return XYZ((bbox.Min.X + bbox.Max.X)/2, 
+               (bbox.Min.Y + bbox.Max.Y)/2, 
+               (bbox.Min.Z + bbox.Max.Z)/2)
 
+def distance(pt1, pt2):
+    return math.sqrt((pt1.X - pt2.X)**2 + (pt1.Y - pt2.Y)**2 + (pt1.Z - pt2.Z)**2)
+
+# 1. Load the JSON mapping
+file_path = forms.pick_file(file_ext='json')
+if not file_path:
+    script.exit()
+
+with open(file_path, 'r') as f:
+    hidden_data = json.load(f)
+
+# 2. Find the linked IFC document
+link_instances = FilteredElementCollector(doc).OfClass(RevitLinkInstance).ToElements()
+if not link_instances:
+    forms.alert("No linked models found.")
+    script.exit()
+
+if len(link_instances) > 1:
+    target_link = forms.select_revit_links(title="Select the target linked IFC")
+else:
+    target_link = link_instances[0]
+
+if not target_link:
+    script.exit()
+
+link_doc = target_link.GetLinkDocument()
+transform = target_link.GetTotalTransform()
+
+# 3. Collect Generic Models in the NEW link
+linked_elements = FilteredElementCollector(link_doc).OfCategory(BuiltInCategory.OST_GenericModel).WhereElementIsNotElementType().ToElements()
+
+elements_to_hide = []
+
+# 4. Compare spatial coordinates
+with forms.ProgressBar(title="Matching geometric locations...") as pb:
+    count = len(linked_elements)
+    for i, el in enumerate(linked_elements):
+        if i % 100 == 0:
+            pb.update_progress(i, count)
+            
+        bbox = el.get_BoundingBox(None)
+        centroid = get_centroid(bbox)
+        
+        if centroid:
+            host_centroid = transform.OfPoint(centroid)
+            
+            # Check if this centroid is near any of our saved coordinates
+            for saved_pt in hidden_data:
+                target_xyz = XYZ(saved_pt['x'], saved_pt['y'], saved_pt['z'])
+                if distance(host_centroid, target_xyz) <= TOLERANCE_FEET:
+                    elements_to_hide.append(el.Id)
+                    break 
+
+# 5. Hide the elements in the active view using Link Overrides
+if elements_to_hide:
+    from System.Collections.Generic import List
+    
+    t = Transaction(doc, "Apply Geometric Hide")
+    t.Start()
+    
     try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
+        # The most robust way to hide linked elements (Revit 2022+)
+        overrides = active_view.GetLinkOverrides(target_link.Id)
+        if not overrides:
+            overrides = RevitLinkGraphicsSettings()
+        
+        # Get existing hidden IDs and merge with new ones
+        hidden_set = set(overrides.GetHiddenElementIds())
+        for eid in elements_to_hide:
+            hidden_set.add(eid)
+            
+        id_list = List[ElementId]()
+        for eid in hidden_set:
+            id_list.Add(eid)
+            
+        overrides.SetHiddenElementIds(id_list)
+        active_view.SetLinkOverrides(target_link.Id, overrides)
+        
+        t.Commit()
+        forms.alert("Successfully hid {} elements based on spatial coordinates.".format(len(elements_to_hide)))
     except Exception as e:
-        forms.alert("Failed to load JSON:\n" + str(e), exitscript=True)
-
-    target_guids = set(data.get("guids", []))
-    if not target_guids:
-        forms.alert("No IDs found in the JSON file.", exitscript=True)
-
-    # 2. Select Target Link
-    links = DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance).ToElements()
-    if not links:
-        forms.alert("No linked files found.", exitscript=True)
-
-    link = forms.select_revit_links(title="Select Target Link to Apply Visibility")
-    if not link:
-        return
-
-    link_doc = link.GetLinkDocument()
-    if not link_doc:
-        forms.alert("Selected link is not loaded.", exitscript=True)
-
-    # 3. Find elements in the link that match the GUIDs
-    collector = DB.FilteredElementCollector(link_doc)\
-                  .WhereElementIsNotElementType()\
-                  .WhereElementIsViewIndependent()
-    
-    ids_to_hide = []
-    
-    with forms.ProgressBar(title="Matching Elements...") as pb:
-        elements = list(collector)
-        count = len(elements)
-        for i, el in enumerate(elements):
-            if i % 100 == 0:
-                pb.update_progress(i, count)
-            
-            # Check IfcGuid or UniqueId
-            guid = None
-            param = el.LookupParameter(IFC_GUID_PARAM)
-            if param and param.HasValue:
-                guid = param.AsString()
-            else:
-                guid = el.UniqueId
-            
-            if guid in target_guids:
-                ids_to_hide.append(el.Id)
-
-    if not ids_to_hide:
-        forms.alert("No matching elements found in the target link.", exitscript=True)
-
-    # 4. Apply Visibility
-    # Note: Hiding elements from a link in a host view is tricky via the API.
-    # We will try to hide them. If the standard HideElements fails, 
-    # we might need to use a different strategy.
-    
-    with revit.Transaction("Apply IFC Visibility Filtering"):
-        try:
-            # We need to hide the elements. In Revit API, hiding linked elements
-            # is done by passing the ElementId from the link document? 
-            # No, that usually doesn't work.
-            # However, in some versions/contexts, you can use:
-            # view.HideElements(ids_to_hide)
-            
-            # Fallback: We'll try to hide them and catch errors.
-            success_count = 0
-            fail_count = 0
-            
-            # Standard HideElements often fails for links.
-            # A more reliable way is to use the ElementId from the link?
-            # Actually, the only way to hide linked elements individually 
-            # is to use a filter OR hide them in the linked view.
-            
-            # Let's try the direct approach first.
-            from System.Collections.Generic import List
-            id_list = List[DB.ElementId]()
-            for eid in ids_to_hide:
-                id_list.Add(eid)
-            
-            try:
-                view.HideElements(id_list)
-                success_count = len(ids_to_hide)
-            except:
-                # If direct hide fails, it's likely because they are linked.
-                forms.alert("Direct hiding of linked elements is not supported in this Revit version/view.\n"
-                            "Consider using a Filter or Linked View override.", title="API Limitation")
-                return
-
-            forms.alert("Successfully hidden {} elements in the current view.".format(success_count))
-            
-        except Exception as e:
-            forms.alert("Error applying visibility:\n" + str(e))
-
-if __name__ == "__main__":
-    run()
+        t.RollBack()
+        forms.alert("Failed to apply visibility overrides.\n\nError: {}".format(e))
+else:
+    forms.alert("No matching elements found in the new link within the tolerance.")

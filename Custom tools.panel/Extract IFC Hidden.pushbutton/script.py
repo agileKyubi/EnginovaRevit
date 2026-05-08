@@ -1,88 +1,90 @@
 # -*- coding: utf-8 -*-
+# Extract hidden elements from IFC
+
+from pyrevit import revit, forms
+from pyrevit import script
 import json
 import os
-from pyrevit import revit, forms, DB
+from Autodesk.Revit.DB import *
 
-# --- CONFIGURATION ---
-IFC_GUID_PARAM = "IfcGuid"
+doc = revit.doc
+active_view = doc.ActiveView
 
-def get_ifc_guid(element):
-    """Retrieves the IFC GUID from an element."""
-    param = element.LookupParameter(IFC_GUID_PARAM)
-    if param and param.HasValue:
-        return param.AsString()
-    return element.UniqueId
+def get_centroid(bbox):
+    if not bbox:
+        return None
+    return XYZ((bbox.Min.X + bbox.Max.X)/2, 
+               (bbox.Min.Y + bbox.Max.Y)/2, 
+               (bbox.Min.Z + bbox.Max.Z)/2)
 
-def run():
-    doc = revit.doc
-    view = doc.ActiveView
+# 1. Find the linked IFC document
+link_instances = FilteredElementCollector(doc).OfClass(RevitLinkInstance).ToElements()
+if not link_instances:
+    forms.alert("No linked models found in this project.")
+    script.exit()
 
-    # 1. Select Linked IFC
-    links = DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance).ToElements()
-    if not links:
-        forms.alert("No linked files found in the project.", exitscript=True)
+# Assuming the first link is the target, or prompt user if multiple
+if len(link_instances) > 1:
+    target_link = forms.select_revit_links(title="Select the linked IFC")
+else:
+    target_link = link_instances[0]
 
-    link = forms.select_revit_links(title="Select Linked IFC to Extract Visibility States")
-    if not link:
-        return
+if not target_link:
+    script.exit()
 
-    link_doc = link.GetLinkDocument()
-    if not link_doc:
-        forms.alert("The selected link is not loaded.", exitscript=True)
+link_doc = target_link.GetLinkDocument()
+if not link_doc:
+    forms.alert("The selected link is not loaded.")
+    script.exit()
 
-    # 2. Get all elements in the link (excluding non-physical ones)
-    collector = DB.FilteredElementCollector(link_doc)\
-                  .WhereElementIsNotElementType()\
-                  .WhereElementIsViewIndependent()
+transform = target_link.GetTotalTransform()
+
+# 2. Get the Visibility Overrides for this link in the active view
+# This is the correct way to find elements hidden individually in a link
+hidden_centroids = []
+
+try:
+    overrides = active_view.GetLinkOverrides(target_link.Id)
+    if not overrides:
+        forms.alert("No overrides found for this link in the current view.")
+        script.exit()
     
-    hidden_guids = []
-    total_elements = 0
-
-    # 3. Check visibility
-    # Note: Checking visibility of individual linked elements in a host view
-    # is complex. We'll check for explicit overrides or hidden categories.
+    hidden_ids = overrides.GetHiddenElementIds()
     
-    # In this version, we'll ask the user if they want to extract HIDDEN or VISIBLE elements
-    mode = forms.alert("Extract which state?", options=["Hidden Elements", "Visible Elements"])
-    if not mode:
-        return
-    
-    extract_hidden = (mode == "Hidden Elements")
+    if not hidden_ids:
+        forms.alert("No individually hidden elements found in the selected link.")
+        script.exit()
 
-    with forms.ProgressBar(title="Analyzing Link Visibility...") as pb:
-        elements = list(collector)
-        count = len(elements)
-        
-        for i, el in enumerate(elements):
-            if i % 100 == 0:
-                pb.update_progress(i, count)
+    # 3. Process hidden elements
+    for eid in hidden_ids:
+        el = link_doc.GetElement(eid)
+        if not el:
+            continue
             
-            # Check if the element is hidden in the host view
-            # Revit handles this via view.IsElementVisibleInView but it's tricky for links.
-            # A common way is to check the view overrides.
-            is_visible = view.IsElementVisibleInView(el) # This works if the element is from the host doc, but for links?
-            # For links, we need to check if the element ID from the link is in the view's hidden elements list.
-            
-            # Actually, a better way for links:
-            if extract_hidden:
-                if not view.IsElementVisibleInView(el):
-                    hidden_guids.append(get_ifc_guid(el))
-            else:
-                if view.IsElementVisibleInView(el):
-                    hidden_guids.append(get_ifc_guid(el))
+        # Optional: Filter by category if needed (e.g. only Generic Models)
+        # if el.Category.Id.IntegerValue != int(BuiltInCategory.OST_GenericModel):
+        #     continue
 
-    # 4. Save to JSON
-    save_path = forms.save_file(file_ext='json', default_name="ifc_visibility_states.json")
-    if save_path:
-        data = {
-            "link_name": link.Name,
-            "mode": mode,
-            "guids": hidden_guids
-        }
-        with open(save_path, 'w') as f:
-            json.dump(data, f, indent=4)
-        
-        forms.alert("Successfully extracted {} IDs to:\n{}".format(len(hidden_guids), save_path))
+        bbox = el.get_BoundingBox(None)
+        centroid = get_centroid(bbox)
+        if centroid:
+            # Transform to host coordinates
+            host_centroid = transform.OfPoint(centroid)
+            hidden_centroids.append({
+                "id": el.Id.IntegerValue,
+                "category": el.Category.Name if el.Category else "Unknown",
+                "x": host_centroid.X,
+                "y": host_centroid.Y,
+                "z": host_centroid.Z
+            })
 
-if __name__ == "__main__":
-    run()
+except Exception as e:
+    forms.alert("Failed to extract hidden elements. Your Revit version may not support this method, or the link is not overridden.\n\nError: {}".format(e))
+    script.exit()
+
+# 4. Save to JSON
+file_path = forms.save_file(file_ext='json', default_name='Hidden_Elements_Map.json')
+if file_path:
+    with open(file_path, 'w') as f:
+        json.dump(hidden_centroids, f, indent=4)
+    forms.alert("Successfully extracted {} hidden element locations.".format(len(hidden_centroids)))
