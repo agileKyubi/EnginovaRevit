@@ -47,8 +47,11 @@ if not target_link:
 link_doc = target_link.GetLinkDocument()
 transform = target_link.GetTotalTransform()
 
-# 3. Collect Generic Models in the NEW link
-linked_elements = FilteredElementCollector(link_doc).OfCategory(BuiltInCategory.OST_GenericModel).WhereElementIsNotElementType().ToElements()
+# 3. Collect ALL physical elements in the NEW link (Work with ANY object)
+linked_elements = FilteredElementCollector(link_doc)\
+                    .WhereElementIsNotElementType()\
+                    .WhereElementIsViewIndependent()\
+                    .ToElements()
 
 elements_to_hide = []
 
