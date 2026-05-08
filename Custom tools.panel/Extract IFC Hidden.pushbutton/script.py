@@ -40,26 +40,60 @@ if not link_doc:
 transform = target_link.GetTotalTransform()
 
 # 2. Get the Visibility Overrides for this link in the active view
-# This is the correct way to find elements hidden individually in a link
 hidden_centroids = []
+hidden_ids = []
+
+print("Analyzing visibility for link: {}".format(target_link.Name))
 
 try:
     overrides = active_view.GetLinkOverrides(target_link.Id)
-    if not overrides:
-        forms.alert("No overrides found for this link in the current view.")
-        script.exit()
-    
-    hidden_ids = overrides.GetHiddenElementIds()
-    
-    if not hidden_ids:
-        forms.alert("No individually hidden elements found in the selected link.")
-        script.exit()
+    if overrides:
+        hidden_ids = list(overrides.GetHiddenElementIds())
+        print("Found {} hidden elements via Link Overrides.".format(len(hidden_ids)))
+    else:
+        print("GetLinkOverrides returned None. Attempting Deep Scan fallback...")
+except Exception as e:
+    print("Link Overrides API not available or failed: {}. Attempting Deep Scan...".format(e))
 
-    # 3. Process hidden elements
-    for eid in hidden_ids:
-        el = link_doc.GetElement(eid)
-        if not el:
-            continue
+# 3. Fallback: If no hidden IDs found via overrides, try a Deep Scan
+# This checks visibility of every element in the link (slower but more resilient)
+if not hidden_ids:
+    with forms.ProgressBar(title="Deep Scanning Link Visibility...") as pb:
+        # Collect all physical elements in the link
+        all_linked = FilteredElementCollector(link_doc)\
+                        .WhereElementIsNotElementType()\
+                        .WhereElementIsViewIndependent()\
+                        .ToElements()
+        
+        count = len(all_linked)
+        for i, el in enumerate(all_linked):
+            if i % 200 == 0:
+                pb.update_progress(i, count)
+            
+            # Check if element is hidden in the active view
+            # Note: el.IsHidden(view) is the most reliable check for individual 'Hide in View'
+            try:
+                if el.IsHidden(active_view):
+                    hidden_ids.append(el.Id)
+            except:
+                # Fallback to general visibility check if IsHidden fails
+                try:
+                    if not active_view.IsElementVisibleInView(el):
+                        hidden_ids.append(el.Id)
+                except:
+                    pass
+
+if not hidden_ids:
+    forms.alert("No individually hidden elements were detected in this link.\n\n"
+                "If you have hidden elements, ensure they were hidden using 'Hide in View > Elements' "
+                "in the current active view.")
+    script.exit()
+
+# 4. Process the identified hidden elements
+for eid in hidden_ids:
+    el = link_doc.GetElement(eid)
+    if not el:
+        continue
             
         # Optional: Filter by category if needed (e.g. only Generic Models)
         # if el.Category.Id.IntegerValue != int(BuiltInCategory.OST_GenericModel):
