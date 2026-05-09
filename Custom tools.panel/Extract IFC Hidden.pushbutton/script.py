@@ -62,9 +62,10 @@ with forms.ProgressBar(title="Deep Scanning All Views...") as pb:
         
         for el in all_elements:
             if el.Id not in hidden_ids:
-                # User requested: use View.IsElementHidden(element.Id) 
-                # No try/except blocks, let it fail for debugging
-                if view.IsElementHidden(el.Id):
+                # 'view.IsElementHidden' does not exist in this Revit API version.
+                # The correct method is 'element.IsHidden(view)'.
+                # Letting errors surface for debugging as requested.
+                if el.IsHidden(view):
                     hidden_ids.add(el.Id)
 
 # 4. Process the unique hidden IDs
