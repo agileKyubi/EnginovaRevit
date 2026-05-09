@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-# Extract_Hidden_Automated.py
+# Extract_Hidden_All_Views.py
 from pyrevit import revit, forms, script
 import json
 from Autodesk.Revit.DB import *
 
 doc = revit.doc
-active_view = doc.ActiveView
 
 def get_centroid(bbox):
     if not bbox:
@@ -14,94 +13,103 @@ def get_centroid(bbox):
                (bbox.Min.Y + bbox.Max.Y)/2, 
                (bbox.Min.Z + bbox.Max.Z)/2)
 
-# 1. Find all linked IFC/Revit documents
+# 1. Collect all linked models
 link_instances = FilteredElementCollector(doc).OfClass(RevitLinkInstance).ToElements()
 if not link_instances:
-    forms.alert("No linked models found in this project.")
+    forms.alert("No linked models found.")
     script.exit()
 
-# If multiple links, let the user select which one to analyze or analyze all?
-# The user said "without the user needing to select it" which could mean the link too.
-# But usually you want to target a specific IFC revision. 
-# I'll analyze all links but keep them separate or merge them.
-# Given the "Apply" script usually targets one link, I'll prompt for the link selection 
-# but automate the element detection inside it.
+loaded_links = [l for l in link_instances if l.GetLinkDocument()]
+if not loaded_links:
+    forms.alert("No loaded linked models found.")
+    script.exit()
 
-if len(link_instances) > 1:
-    target_link = forms.select_revit_links(title="Select the linked model to extract hidden elements from")
+if len(loaded_links) > 1:
+    target_link = forms.select_revit_links(title="Select the linked model to analyze")
 else:
-    target_link = link_instances[0]
+    target_link = loaded_links[0]
 
 if not target_link:
     script.exit()
 
 link_doc = target_link.GetLinkDocument()
-if not link_doc:
-    forms.alert("The selected link is not loaded.")
-    script.exit()
-
 transform = target_link.GetTotalTransform()
 
+# 2. Collect Relevant Views
+# We iterate through all physical views where objects might be hidden
+all_views = FilteredElementCollector(doc).OfClass(View).ToElements()
+valid_types = [ViewType.FloorPlan, ViewType.ThreeD, ViewType.Section, ViewType.Elevation, ViewType.CeilingPlan]
+relevant_views = [v for v in all_views if not v.IsTemplate and v.ViewType in valid_types]
+
+hidden_ids = set()
 hidden_centroids = []
 
-# 2. Automated Detection of Hidden Elements
-# We check the Link Overrides first (fastest)
-# Then fallback to a Deep Scan if needed.
+print("Scanning {} views for hidden elements in link: {}...".format(len(relevant_views), target_link.Name))
 
-hidden_ids = []
-overrides = active_view.GetLinkOverrides(target_link.Id)
-if overrides:
-    hidden_ids = list(overrides.GetHiddenElementIds())
+# 3. Automated Detection across ALL Views
+with forms.ProgressBar(title="Scanning All Views for Hidden Elements...") as pb:
+    view_count = len(relevant_views)
+    for i, view in enumerate(relevant_views):
+        pb.update_progress(i, view_count)
+        
+        # Method A: Link Overrides (Fastest)
+        try:
+            overrides = view.GetLinkOverrides(target_link.Id)
+            if overrides:
+                ids = overrides.GetHiddenElementIds()
+                for eid in ids:
+                    hidden_ids.add(eid)
+        except:
+            pass
 
-if not hidden_ids:
-    # Deep Scan Fallback
-    # Collect all physical, view-independent elements in the link
-    with forms.ProgressBar(title="Deep Scanning for Hidden Elements (Any Category)...") as pb:
-        all_linked = FilteredElementCollector(link_doc)\
+    # If Method A didn't find much, or as a thorough measure, 
+    # we can do a deep scan on the most important view (Active View) 
+    # or iterate through elements. 
+    # But since the user wants "All Views", the overrides should be enough 
+    # if they used 'Hide in View'.
+    
+    # Check if we should also do a Deep Scan on the active view as a fallback
+    active_view = doc.ActiveView
+    if active_view and active_view.Id in [v.Id for v in relevant_views]:
+        # Perform deep scan on elements against active view
+        all_elements = FilteredElementCollector(link_doc)\
                         .WhereElementIsNotElementType()\
                         .WhereElementIsViewIndependent()\
                         .ToElements()
         
-        count = len(all_linked)
-        for i, el in enumerate(all_linked):
-            if i % 500 == 0:
-                pb.update_progress(i, count)
-            
-            # Use IsHidden check - this works for individually hidden elements
-            try:
-                if el.IsHidden(active_view):
-                    hidden_ids.append(el.Id)
-            except:
-                # If IsHidden fails, we could try IsElementVisibleInView
-                # but that's often less accurate for "individually hidden"
-                pass
+        for el in all_elements:
+            if el.Id not in hidden_ids:
+                try:
+                    if el.IsHidden(active_view):
+                        hidden_ids.add(el.Id)
+                except:
+                    pass
 
-if hidden_ids:
-    for eid in hidden_ids:
-        el = link_doc.GetElement(eid)
-        if not el:
-            continue
-            
-        # WORK WITH ANY OBJECT (No category filter)
-        bbox = el.get_BoundingBox(None)
-        centroid = get_centroid(bbox)
+# 4. Process the unique hidden IDs
+for eid in hidden_ids:
+    el = link_doc.GetElement(eid)
+    if not el:
+        continue
         
-        if centroid:
-            host_centroid = transform.OfPoint(centroid)
-            hidden_centroids.append({
-                "id": el.Id.IntegerValue,
-                "category": el.Category.Name if el.Category else "Unknown",
-                "x": host_centroid.X,
-                "y": host_centroid.Y,
-                "z": host_centroid.Z
-            })
+    bbox = el.get_BoundingBox(None)
+    centroid = get_centroid(bbox)
+    
+    if centroid:
+        host_centroid = transform.OfPoint(centroid)
+        hidden_centroids.append({
+            "id": el.Id.IntegerValue,
+            "category": el.Category.Name if el.Category else "Unknown",
+            "x": host_centroid.X,
+            "y": host_centroid.Y,
+            "z": host_centroid.Z
+        })
 
-# 3. Save to JSON
+# 5. Save to JSON
 if hidden_centroids:
     file_path = forms.save_file(file_ext='json', default_name='Hidden_Elements_Map.json')
     if file_path:
         with open(file_path, 'w') as f:
             json.dump(hidden_centroids, f, indent=4)
-        forms.alert("Successfully extracted {} hidden element locations (All Categories).".format(len(hidden_centroids)))
+        forms.alert("Successfully extracted {} hidden element locations from {} views.".format(len(hidden_centroids), len(relevant_views)))
 else:
-    forms.alert("No hidden elements were detected in the selected link.")
+    forms.alert("No hidden elements were detected across all scanned views.")
