@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 # Extract_Hidden_All_Views.py
-from pyrevit import revit, forms, script
+from pyrevit import revit, forms, script, output
 import json
 from Autodesk.Revit.DB import *
 
 doc = revit.doc
-
+active_view = revit.active_view
 def get_centroid(bbox):
     if not bbox:
         return None
@@ -36,7 +36,6 @@ link_doc = target_link.GetLinkDocument()
 transform = target_link.GetTotalTransform()
 
 # 2. Collect Relevant Views
-# We iterate through all physical views where objects might be hidden
 all_views = FilteredElementCollector(doc).OfClass(View).ToElements()
 valid_types = [ViewType.FloorPlan, ViewType.ThreeD, ViewType.Section, ViewType.Elevation, ViewType.CeilingPlan]
 relevant_views = [v for v in all_views if not v.IsTemplate and v.ViewType in valid_types]
@@ -46,44 +45,27 @@ hidden_centroids = []
 
 print("Scanning {} views for hidden elements in link: {}...".format(len(relevant_views), target_link.Name))
 
-# 3. Automated Detection across ALL Views
-with forms.ProgressBar(title="Scanning All Views for Hidden Elements...") as pb:
+
+
+
+# 3. Deep Automated Detection across ALL Views
+# We collect all physical elements once
+all_elements = FilteredElementCollector(link_doc)\
+                .WhereElementIsNotElementType()\
+                .WhereElementIsViewIndependent()\
+                .ToElements()
+
+with forms.ProgressBar(title="Deep Scanning All Views...") as pb:
     view_count = len(relevant_views)
     for i, view in enumerate(relevant_views):
         pb.update_progress(i, view_count)
         
-        # Method A: Link Overrides (Fastest)
-        try:
-            overrides = view.GetLinkOverrides(target_link.Id)
-            if overrides:
-                ids = overrides.GetHiddenElementIds()
-                for eid in ids:
-                    hidden_ids.add(eid)
-        except:
-            pass
-
-    # If Method A didn't find much, or as a thorough measure, 
-    # we can do a deep scan on the most important view (Active View) 
-    # or iterate through elements. 
-    # But since the user wants "All Views", the overrides should be enough 
-    # if they used 'Hide in View'.
-    
-    # Check if we should also do a Deep Scan on the active view as a fallback
-    active_view = doc.ActiveView
-    if active_view and active_view.Id in [v.Id for v in relevant_views]:
-        # Perform deep scan on elements against active view
-        all_elements = FilteredElementCollector(link_doc)\
-                        .WhereElementIsNotElementType()\
-                        .WhereElementIsViewIndependent()\
-                        .ToElements()
-        
         for el in all_elements:
             if el.Id not in hidden_ids:
-                try:
-                    if el.IsHidden(active_view):
-                        hidden_ids.add(el.Id)
-                except:
-                    pass
+                # User requested: use View.IsElementHidden(element.Id) 
+                # No try/except blocks, let it fail for debugging
+                if view.IsElementHidden(el.Id):
+                    hidden_ids.add(el.Id)
 
 # 4. Process the unique hidden IDs
 for eid in hidden_ids:
